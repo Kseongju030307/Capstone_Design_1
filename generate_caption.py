@@ -30,6 +30,9 @@ def image_crop():
     images = []
 
     for i, box in enumerate(results.boxes):
+        conf = float(box.conf[0])
+        if conf < 0.6:
+            continue  # 60% 미만은 스킵
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cropped = image[y1:y2, x1:x2]
         cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
