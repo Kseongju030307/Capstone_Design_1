@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "Sketch-Catch",
+    "slug": "SketchApp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/ako.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/ako.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.jihyeon604.SketchApp"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "57d91e05-81df-4e18-a335-5851629e0b5e"
+      }
+    }
+  }
+}

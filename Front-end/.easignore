@@ -1,0 +1,19 @@
+# 기본 무시 대상
+node_modules
+.expo
+.git
+android
+ios
+web-build
+dist
+*.log
+
+# 시스템 경로 강제 제외 (특히 윈도우 경로)
+../AppData/
+../Roaming/
+../Local Settings/
+../Microsoft/
+../OneDrive/
+../Temp/
+../*.*
+../*/*
