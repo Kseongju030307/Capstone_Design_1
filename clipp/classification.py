@@ -1,146 +1,113 @@
 import os
-import torch
-import random
-from PIL import Image
-from torchvision import transforms
-import open_clip
-from ultralytics import YOLO
 import cv2
-from torchvision.utils import save_image
+import torch
 import numpy as np
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+from PIL import Image
+from ultralytics import YOLO
+from torchvision import transforms
+from torchvision.utils import save_image
+import open_clip
 
-image_path = "/media/hdd/hahyeon/Capstone_Design_1/test_image/test5.jpg"
-image_path = "/media/hdd/hahyeon/BLIP/sketch.png"
+# ====== 설정 경로 ======
+images_path = "/media/hdd/hahyeon/Capstone_Design_1/test_image/images"
+labels_path = "/media/hdd/hahyeon/Capstone_Design_1/test_image/labels"
+category_file = "/media/hdd/hahyeon/open_clip/dataset/dataset_category_original.txt"
+checkpoint_path = "/media/hdd/hahyeon/open_clip/model_checkpoint/openclip_step_thin175000.pth"
+save_dir = '/media/hdd/hahyeon/open_clip/ppt_image'
+output_dir = "cropped_objects"
+yolo_model_path = "/media/hdd/hahyeon/Capstone_Design_1/yolov11/weight/best.pt"
 
-def image_crop():
-    # 1. YOLOv11 모델 로드
-    model = YOLO("/media/hdd/hahyeon/Capstone_Design_1/yolov11/weight/best.pt")  # finetuning된 모델 경로로 변경
+# ====== Category 불러오기 ======
+with open(category_file, 'r') as f:
+    categories = [line.strip() for line in f.readlines()]
 
-    # 2. 이미지 로드
+# ====== 모델 로드 (YOLO + OpenCLIP) ======
+yolo_model = YOLO(yolo_model_path)
+
+clip_model, _, _ = open_clip.create_model_and_transforms('ViT-L-14', pretrained='laion2b_s32b_b82k')
+clip_model.visual.output_dim = 768
+classifier_head = torch.nn.Linear(768, 100)  # 클래스 수에 맞게 조정
+model = torch.nn.Sequential(clip_model.visual, classifier_head)
+model.load_state_dict(torch.load(checkpoint_path))
+model.eval()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+# ====== Transform 정의 ======
+transform = transforms.Compose([
+    # 이미지 리사이즈 (224x224)
+    transforms.Lambda(lambda img: img.resize((224, 224), Image.NEAREST)),
+
+    # 첫 번째 블러 + 이진화
+    transforms.Lambda(lambda img: Image.fromarray(
+        cv2.threshold(
+            cv2.GaussianBlur(np.array(img), (7, 7), 0),
+            220, 255, cv2.THRESH_BINARY)[1] 
+    )),
+
+    # 두 번째 블러 + 이진화
+    transforms.Lambda(lambda img: Image.fromarray(
+        cv2.threshold(
+            cv2.GaussianBlur(np.array(img), (5, 5), 0),
+            230, 255, cv2.THRESH_BINARY)[1] 
+    )),
+
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.481, 0.458, 0.408], std=[0.269, 0.261, 0.276])
+])
+
+os.makedirs(save_dir, exist_ok=True)
+
+# ====== 정확도 계산 ======
+total_matched = 0
+total_expected = 0
+
+for idx in range(100):
+    image_name = f"composite_{idx:03d}.png"
+    label_name = f"composite_{idx:03d}.txt"
+
+    image_path = os.path.join(images_path, image_name)
+    label_path = os.path.join(labels_path, label_name)
+
     image = cv2.imread(image_path)
 
-    # 3. 이미지 탐지
-    results = model(image)[0]  # 결과는 리스트로 반환되므로 [0]으로 첫 번째 결과 가져옴
+    # YOLO로 객체 탐지
+    results = yolo_model(image, verbose=False)[0]
+    cropped_images = []
 
-    # 4. 바운딩 박스 기반으로 객체 크롭
-    output_dir = "cropped_objects"
-    os.makedirs(output_dir, exist_ok=True)
-
-    images = []
-
-    for i, box in enumerate(results.boxes):
+    for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cropped = image[y1:y2, x1:x2]
         cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(cropped_rgb)
-        images.append(pil_image)
-        
-    return images
+        cropped_images.append(pil_image)
 
+    # 정답 인덱스 로드
+    with open(label_path, 'r') as f:
+        true_labels = [int(line.strip()) for line in f.readlines()]
 
-def image_classification(images):
-    category_file = "/media/hdd/hahyeon/open_clip/dataset/dataset_category.txt"
-    with open(category_file, 'r') as f:
-        categories = [line.strip() for line in f.readlines()]
-    
-    # 1. 모델 및 토큰 설정
-    model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='laion2b_s32b_b82k')
+    matched = 0  # 이 이미지에서 맞춘 개수
 
-    # 학습된 모델을 위한 classifier head 추가
-    num_classes = 100
-    model.visual.output_dim = 768
-    classifier_head = torch.nn.Linear(768, num_classes)
-
-    # 모델 결합
-    model = torch.nn.Sequential(model.visual, classifier_head)
-
-    # 체크포인트 불러오기
-    checkpoint_path = "/media/hdd/hahyeon/open_clip/model_checkpoint/openclip_step90000.pth"
-    model.load_state_dict(torch.load(checkpoint_path))
-    model.eval()
-
-    # 디바이스 설정
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-
-
-    # 이미지 전처리
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: Image.fromarray(
-            cv2.resize(
-                cv2.threshold(
-                    cv2.GaussianBlur(np.array(img), (15, 15), 0),  # 첫 번째 블러 적용
-                    240, 255, cv2.THRESH_BINARY_INV  # 임계값 이진화
-                )[1],
-                (224, 224),  # 리사이즈 (보간 → 선 두껍게)
-                interpolation=cv2.INTER_NEAREST
-            )
-        )),
-        transforms.Lambda(lambda img: Image.fromarray(
-            cv2.GaussianBlur(np.array(img), (27, 27), 0)  # 두 번째 블러 적용
-        )),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.481, 0.458, 0.408], std=[0.269, 0.261, 0.276])
-    ])
-
-    # 이미지 분류 및 출력
-    save_dir = '/media/hdd/hahyeon/open_clip/ppt_image'
-    os.makedirs(save_dir, exist_ok=True)
-    predictCategories = []
-
-    # 이미지 분류 및 저장
+    # cropped 이미지들을 분류하고 정답과 비교
     with torch.no_grad(), torch.amp.autocast(device_type=device):
-        for idx, image in enumerate(images):
-            image_tensor = transform(image).unsqueeze(0).to(device)
+        for i, cropped_img in enumerate(cropped_images):
+            image_tensor = transform(cropped_img).unsqueeze(0).to(device)
+            save_image(image_tensor, os.path.join(save_dir, f"{idx:03d}_{i}.png"))
 
-            # 이미지 저장 (정규화 전 상태로 저장하기 위해 Normalize 이전 텐서 저장)
-            # → transform 내 Normalize를 제외하고 따로 처리하거나, 저장 시 비정규화해줘야 함
-            save_image(image_tensor, os.path.join(save_dir, f'transformed_image_{idx+1}.png'))
-
-            # 분류
             logits = model(image_tensor)
             probs = torch.softmax(logits, dim=-1)
             pred_class = torch.argmax(probs, dim=-1).item()
-            pred_prob = probs[0, pred_class].item()
 
-            print(f"Image {idx + 1}: Predicted Class = {categories[pred_class]}, Probability = {pred_prob:.4f}")
-            predictCategories.append(categories[pred_class])
-            
-    return predictCategories
-            
-            
-def generate_caption(predictCategories):
-    # 모델과 프로세서 로드
-    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b", use_fast=True)
-    model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", device_map="auto").to("cuda")
+            if pred_class in true_labels:
+                matched += 1
 
-    # 이미지 불러오기
-    image = Image.open(image_path).convert("RGB")
+    # 이 composite 이미지의 정확도 계산
+    image_accuracy = matched / len(true_labels) if true_labels else 0
+    print(f"[{image_name}] Accuracy: {image_accuracy:.2%} ({matched}/{len(true_labels)})")
 
-    # 질문 입력 및 처리
-    question = f"This image contains {predictCategories[0]}, {predictCategories[1]}, and {predictCategories[2]}. 
-        Please describe the image focusing on these objects and the overall scene."
-    prompt = f"Question: {question} Answer:" 
-    inputs = processor(image, return_tensors="pt").to("cuda")
+    total_matched += matched
+    total_expected += len(true_labels)
 
-    # 모델 예측 수행 (더 유연한 생성 방식 적용)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=50,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        num_return_sequences=10  # 답변 5개 생성
-    )
-
-    # 결과 출력 (질문 제외하고 답변만 출력)
-    for i, output in enumerate(outputs):
-        answer = processor.decode(output, skip_special_tokens=True).strip()
-        if "Answer:" in answer:
-            answer = answer.split("Answer:")[-1].strip()
-        print(f"Answer {i+1}: {answer}")
-
-images = image_crop()
-predictCategories = image_classification(images)
-generate_caption(predictCategories)
+# 전체 평균 정확도
+overall_accuracy = total_matched / total_expected if total_expected > 0 else 0
+print(f"\n✅ Overall Accuracy: {overall_accuracy:.2%} ({total_matched}/{total_expected})")
