@@ -78,7 +78,7 @@ def preprocess_sketch(image_path, output_path, target_thickness=5):
     # === 적응형 이진화 ===
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)
     
-    # === 줄 제거 (Morphological Operations) ===
+    # === 노이즈 제거2 (Morphological Operations) ===
     kernel = np.ones((1, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
     
