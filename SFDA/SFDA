@@ -1,0 +1,213 @@
+import os
+import random
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+import numpy as np
+import open_clip
+from collections import defaultdict
+from copy import deepcopy
+
+# ===============================
+# ⚙️ Config
+# ===============================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 64
+IMG_SIZE = 224
+CLIP_MODEL = "ViT-B-32"
+CLIP_PRETRAINED = "openai"
+DATA_ROOTS = ['/content/drive/MyDrive/종합설계1/sketch_extracted/sketch', '/content/drive/MyDrive/종합설계1/quickdraw_extracted/quickdraw']
+EPOCHS = 50
+PATIENCE = 3
+
+# ===============================
+# 📦 Load CLIP image & text encoders
+# ===============================
+full_model, _, preprocess = open_clip.create_model_and_transforms(CLIP_MODEL, pretrained=CLIP_PRETRAINED)
+tokenizer = open_clip.get_tokenizer(CLIP_MODEL)
+full_model = full_model.to(DEVICE)
+full_model.eval()
+image_encoder = full_model.visual  # for image encoding
+
+# ===============================
+# 📁 Dataset split (7:2:1 per class)
+# ===============================
+def split_dataset(folder_path, split=(0.7, 0.2, 0.1), use_ratio=1.0):
+    class_dirs = [d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))]
+    train, val, test = [], [], []
+
+    for cls in class_dirs:
+        cls_path = os.path.join(folder_path, cls)
+        imgs = [os.path.join(cls_path, img) for img in os.listdir(cls_path) if img.endswith(('.png', '.jpg', '.jpeg'))]
+
+        # QuickDraw 데이터셋의 경우, 전체 데이터의 use_ratio만 사용
+        if "quickdraw" in folder_path:
+            n = len(imgs)
+            imgs = random.sample(imgs, int(n * use_ratio))  # QuickDraw의 경우 40%만 사용
+
+        random.shuffle(imgs)
+        n = len(imgs)
+        n_train, n_val = int(n * split[0]), int(n * split[1])
+        train += [(img, cls) for img in imgs[:n_train]]
+        val += [(img, cls) for img in imgs[n_train:n_train + n_val]]
+        test += [(img, cls) for img in imgs[n_train + n_val:]]
+
+    return train, val, test
+
+all_train, all_val, all_test = [], [], []
+
+for path in DATA_ROOTS:
+    if "quickdraw" in path:
+        tr, va, te = split_dataset(path, use_ratio=0.4)  # QuickDraw 데이터는 40%만 사용
+    else:
+        tr, va, te = split_dataset(path)
+    all_train += tr
+    all_val += va
+    all_test += te
+
+all_classes = sorted(list(set([label for _, label in all_train])))
+class_to_idx = {cls: i for i, cls in enumerate(all_classes)}
+
+# ===============================
+# 🖼️ Custom dataset
+# ===============================
+class SketchDataset(Dataset):
+    def __init__(self, data, class_to_idx):
+        self.data = data
+        self.class_to_idx = class_to_idx
+        self.transform = preprocess
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_path, label = self.data[idx]
+        image = self.transform(Image.open(img_path).convert("RGB"))
+        label_idx = self.class_to_idx[label]
+        return image, label_idx
+
+train_loader = DataLoader(SketchDataset(all_train, class_to_idx), batch_size=BATCH_SIZE, shuffle=True,num_workers=4, pin_memory=True)
+val_loader = DataLoader(SketchDataset(all_val, class_to_idx), batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+# ===============================
+# 🔤 텍스트 임베딩 생성
+# ===============================
+@torch.no_grad()
+def get_text_features(classes):
+    texts = [f"a sketch of a {cls}" for cls in classes]
+    tokenized = tokenizer(texts).to(DEVICE)
+    text_features = full_model.encode_text(tokenized)
+    return text_features / text_features.norm(dim=-1, keepdim=True)
+
+text_features = get_text_features(all_classes)
+
+# ===============================
+# 🧠 Pseudo-label 생성 함수
+# ===============================
+@torch.no_grad()
+def generate_pseudo_labels(images, text_features):
+    image_features = image_encoder(images)
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    sim = image_features @ text_features.T
+    pseudo_labels = sim.argmax(dim=-1)
+    return pseudo_labels, image_features
+
+# ===============================
+# 🟡 Linear classifier + EMA
+# ===============================
+class SimpleClassifier(torch.nn.Module):
+    def __init__(self, feat_dim, num_classes):
+        super().__init__()
+        self.linear = torch.nn.Linear(feat_dim, num_classes)
+
+    def forward(self, x):
+        return self.linear(x)
+
+student_model = SimpleClassifier(image_encoder.output_dim, len(all_classes)).to(DEVICE)
+ema_model = deepcopy(student_model)
+
+def update_ema(model, ema_model, alpha=0.999):
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
+
+# ===============================
+# 🧮 Loss & Optimizer
+# ===============================
+optimizer = torch.optim.Adam(student_model.parameters(), lr=1e-4)
+criterion = torch.nn.CrossEntropyLoss()
+
+# ===============================
+# ⏹️ Early Stopping
+# ===============================
+class EarlyStopping:
+    def __init__(self, patience=3, verbose=True):
+        self.patience = patience
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+        self.verbose = verbose
+
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    for images, _ in tqdm(loader, desc="Evaluating"):
+        images = images.to(DEVICE)
+        pseudo_labels, image_features = generate_pseudo_labels(images, text_features)
+        logits = model(image_features)
+        loss = criterion(logits, pseudo_labels)
+        total_loss += loss.item() * images.size(0)
+        n += images.size(0)
+    return total_loss / n
+
+# ===============================
+# 🏋️‍♂️ Training Loop
+# ===============================
+early_stopper = EarlyStopping(patience=PATIENCE)
+
+for epoch in range(EPOCHS):
+    student_model.train()
+    total_loss = 0.0
+    total_samples = 0
+
+    for images, _ in tqdm(train_loader, desc=f"Epoch {epoch}"):
+        images = images.to(DEVICE)
+
+        with torch.no_grad():
+            pseudo_labels, image_features = generate_pseudo_labels(images, text_features)
+
+        logits = student_model(image_features)
+        loss = criterion(logits, pseudo_labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        update_ema(student_model, ema_model)
+
+        batch_size = images.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        train_loss = total_loss / total_samples
+
+    val_loss = evaluate(student_model, val_loader)
+    print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+
+    early_stopper(val_loss)
+    if early_stopper.early_stop:
+        print("Early stopping triggered.")
+        break
